@@ -430,11 +430,30 @@ def parse_volunteer_activities(tables):
             if _is_volunteer_header(merged_text):
                 continue
 
-            # 날짜가 있는지 확인 — 없으면 스킵
+            # 날짜가 있는지 확인
             if not DATE_PATTERN.search(merged_text):
                 # 날짜 없는 행은 개별 셀 형식일 수 있음 (date in another cell)
                 # 전체 행에서 날짜 찾기
                 if not DATE_PATTERN.search(row_text):
+                    # 페이지 분리로 인한 continuation row: 이전 항목의 content에 이어붙이기
+                    if rows:
+                        cont_parts = []
+                        for cell in row[1:]:
+                            if cell is None:
+                                continue
+                            cell_str = str(cell).strip()
+                            if not cell_str:
+                                continue
+                            # 숫자만 있는 셀(시간/누계시간), 장소 셀 제외
+                            if re.match(r"^\d+$", cell_str):
+                                continue
+                            if re.match(r"^\([^)]+\)", cell_str):
+                                continue
+                            cont_parts.append(cell_str)
+                        if cont_parts:
+                            cont = " ".join(cont_parts)
+                            last = rows[-1]
+                            last["content"] = (last["content"] + " " + cont).strip() if last["content"] else cont
                     continue
                 # 개별 셀 형식: 각 컬럼이 분리된 경우
                 _parse_volunteer_row_columns(row, current_year, rows)
