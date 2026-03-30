@@ -460,9 +460,14 @@ def parse_volunteer_activities(tables):
                 continue
 
             # \n으로 분리하여 라인별 처리
+            # pdfplumber 병합 셀에서 활동내용이 줄바꿈되면 날짜 라인 위/아래로 감싸짐:
+            #   [content_prefix]          ← 활동내용 첫 줄 (날짜 위)
+            #   [date] [place] [hrs] [cum] ← 날짜 라인
+            #   [content_suffix]          ← 활동내용 나머지 (날짜 아래)
             lines = merged_text.split("\n")
-            buffer = ""  # 날짜 없는 라인 = 다음 항목의 content
-            seen_date_in_cell = False  # 이 셀에서 날짜를 하나라도 봤는지
+            prefix_buffer = []  # 날짜 이전의 비날짜 라인들
+            seen_date_in_cell = False
+            expecting_suffix = False  # 날짜 라인에 content가 없으면 다음 라인이 suffix
 
             for line in lines:
                 line = line.strip()
@@ -481,13 +486,7 @@ def parse_volunteer_activities(tables):
                 )
 
                 if date_match:
-                    # 첫 날짜 이전의 buffer = 이전 항목의 content 이어붙이기
-                    if not seen_date_in_cell and buffer and rows:
-                        last = rows[-1]
-                        last["content"] = (last["content"] + buffer).strip() if last["content"] else buffer.strip()
-                        buffer = ""
-
-                    seen_date_in_cell = True
+                    expecting_suffix = False
                     date_range = date_match.group(1) + (date_match.group(2) or "")
                     rest = date_match.group(3).strip()
 
@@ -517,38 +516,60 @@ def parse_volunteer_activities(tables):
                         else:
                             content_part = remainder
 
-                    # buffer에 이전 라인의 감싸진 텍스트가 있으면 content 앞에 붙임
-                    if buffer:
-                        content = (buffer + " " + content_part).strip() if content_part else buffer.strip()
-                        buffer = ""
-                    else:
-                        content = content_part
+                    # 날짜 라인 자체에 content가 있는지 (줄바꿈 없이 한 줄에 들어간 경우)
+                    date_line_has_content = bool(content_part)
+
+                    # prefix_buffer 처리
+                    if prefix_buffer:
+                        if not seen_date_in_cell and rows:
+                            # 셀의 첫 날짜 (페이지 분리 경계)
+                            if not date_line_has_content and len(prefix_buffer) > 1:
+                                # content가 감싸짐 → 마지막 줄 = 이 항목의 prefix, 나머지 = 이전 항목 이어붙이기
+                                cont = " ".join(prefix_buffer[:-1])
+                                last = rows[-1]
+                                last["content"] = (last["content"] + " " + cont).strip() if last["content"] else cont
+                                content_part = prefix_buffer[-1]
+                            elif not date_line_has_content and len(prefix_buffer) == 1:
+                                # 버퍼 1줄 + content 없음 → 이 항목의 prefix
+                                content_part = prefix_buffer[0]
+                            else:
+                                # date_line_has_content → 버퍼 전체가 이전 항목 이어붙이기
+                                cont = " ".join(prefix_buffer)
+                                last = rows[-1]
+                                last["content"] = (last["content"] + " " + cont).strip() if last["content"] else cont
+                        else:
+                            # 셀 내 후속 날짜 또는 이전 항목 없음 → 버퍼는 이 항목의 prefix
+                            prefix_text = " ".join(prefix_buffer)
+                            content_part = (prefix_text + " " + content_part).strip() if content_part else prefix_text
+                        prefix_buffer = []
+
+                    seen_date_in_cell = True
+                    expecting_suffix = not date_line_has_content
 
                     rows.append({
                         "id": new_id(),
                         "year": current_year,
                         "dateRange": date_range.strip(),
                         "place": place,
-                        "content": content,
+                        "content": content_part,
                         "hours": hours,
                     })
                 else:
-                    # 날짜 없는 라인 = 감싸진 content 텍스트
-                    # 매우 짧은 조각(1-2자)은 이전 항목의 content 이어붙이기
-                    # (줄바꿈으로 잘린 단어 조각, 예: "캠페" + "인")
-                    if len(line) <= 2 and rows and seen_date_in_cell:
-                        last = rows[-1]
-                        last["content"] = (last["content"] + line).strip() if last["content"] else line
-                    elif buffer:
-                        buffer += " " + line
+                    # 비날짜 라인 처리
+                    if expecting_suffix:
+                        # 날짜 라인 아래의 감싸진 content 나머지 (suffix)
+                        if rows:
+                            last = rows[-1]
+                            last["content"] = (last["content"] + line).strip() if last["content"] else line
+                        expecting_suffix = False
                     else:
-                        buffer = line
+                        prefix_buffer.append(line)
 
-            # buffer가 남아있으면 마지막 항목의 content에 append
-            if buffer and rows and rows[-1]["year"] == current_year:
+            # 셀 끝에 남은 prefix_buffer → 마지막 항목의 content에 이어붙이기
+            if prefix_buffer and rows and rows[-1]["year"] == current_year:
                 last = rows[-1]
-                last["content"] = (last["content"] + " " + buffer).strip() if last["content"] else buffer.strip()
-                buffer = ""
+                cont = " ".join(prefix_buffer)
+                last["content"] = (last["content"] + " " + cont).strip() if last["content"] else cont
 
     return rows
 
