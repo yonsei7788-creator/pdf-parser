@@ -197,7 +197,7 @@ def parse_awards(table):
 
 # ─── Creative Activities Parser ───────────────────────────────────────────
 
-AREA_PATTERN = re.compile(r"^(자율활동|동아리활동|진로활동)$")
+AREA_PATTERN = re.compile(r"^(자율[·\s]*자치활동|자율활동|동아리활동|진로활동)$")
 
 
 def parse_creative_activities(tables):
@@ -1099,6 +1099,10 @@ def _parse_evaluation_row(row, year, output):
     if not text:
         text = str(row[1] or "").strip() if len(row) > 1 else ""
     if not text or len(text) < 10:
+        return
+
+    # "해당 학년의 자료가 없습니다" 등 빈 학년 안내 텍스트 필터링
+    if re.search(r"해당\s*학년의\s*자료가\s*없습니다", text):
         return
 
     # 전체 텍스트를 합침
