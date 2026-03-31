@@ -913,17 +913,9 @@ def _expand_categories(categories, target_len):
 
 def _merge_split_names(raw_items):
     """줄바꿈으로 잘린 과목/교과명 병합.
-    짧은 조각(<= 4자, 공백 포함)을 이전 항목에 합침.
-    단, 독립적 과목명(한글 2자 이상 + Ⅰ/Ⅱ/Ⅲ, 또는 알려진 짧은 과목명)은 유지.
+    한글 2자 미만의 짧은 조각("1", "Ⅰ", "험" 등)을 이전 항목에 합침.
+    한글 2자 이상이면 독립적 과목명으로 판단하여 유지.
     """
-    # 2글자 이하의 독립적 과목명 목록
-    KNOWN_SHORT_SUBJECTS = {
-        "기하", "확통", "미적", "화학", "물리", "생명", "지구",
-        "국어", "수학", "영어", "과학", "사회", "한문", "음악",
-        "미술", "체육", "정보", "독서", "문학", "윤리", "경제",
-        "정치", "법과", "역사", "도덕",
-    }
-
     merged = []
     for s in raw_items:
         s = s.strip()
@@ -933,22 +925,13 @@ def _merge_split_names(raw_items):
             merged.append(s)
             continue
 
-        # 독립적 과목명 (한글 2자 이상 + Ⅰ/Ⅱ/Ⅲ)은 항상 유지
-        if re.match(r"^[가-힣]{2,}[ⅠⅡⅢ]$", s):
+        # 한글 2자 이상이면 독립 과목명 → 유지
+        korean_count = sum(1 for c in s if "가" <= c <= "힣")
+        if korean_count >= 2:
             merged.append(s)
-            continue
-
-        # 알려진 짧은 과목명은 유지
-        if s in KNOWN_SHORT_SUBJECTS:
-            merged.append(s)
-            continue
-
-        prev = merged[-1]
-        # 짧은 조각(공백 포함 4자 이하) → 이전 항목에 붙임
-        if len(s) <= 4:
-            merged[-1] = prev + s
         else:
-            merged.append(s)
+            # 한글 1자 이하 → PDF 줄바꿈 잔여 조각, 이전 항목에 합침
+            merged[-1] = merged[-1] + s
     return merged
 
 
