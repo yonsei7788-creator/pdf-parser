@@ -747,6 +747,8 @@ def _parse_general_rows(row, year, output):
     ranks = str(row[6] or "").split("\n") if len(row) > 6 else []
     notes = str(row[7] or "").split("\n") if len(row) > 7 else []
 
+    _fix_leaked_char(categories, subjects)
+
     max_len = max(len(subjects), len(scores), len(achievements), 1)
     cleaned_categories = _expand_categories(categories, max_len)
 
@@ -916,6 +918,31 @@ def _merge_split_names(raw_items):
     return merged
 
 
+def _fix_leaked_char(categories, subjects):
+    """PDF 테이블 추출 시 교과 셀의 마지막 글자가 과목 셀로 밀려나는 오류를 보정.
+    예: 교과 "기술・가정/제2외국어/문/교양", 과목 "한 인공지능 기초"
+    → 교과 "기술・가정/제2외국어/한문/교양", 과목 "인공지능 기초"
+    """
+    for i, subj in enumerate(subjects):
+        m = re.match(r'^([가-힣])\s+(.+)$', subj)
+        if not m:
+            continue
+        leaked = m.group(1)
+        subjects[i] = m.group(2)
+
+        # 교과명 보정: 글자는 교과 셀 끝에서 밀려나므로 마지막 교과 항목을 수정
+        if categories:
+            last_idx = len(categories) - 1
+            cat = categories[last_idx]
+            parts = cat.split("/")
+            for j, part in enumerate(parts):
+                part_s = part.strip()
+                if part_s and len(part_s) <= 2:
+                    parts[j] = part.replace(part_s, leaked + part_s, 1)
+                    categories[last_idx] = "/".join(parts)
+                    break
+
+
 _career_current_semester = [0]
 
 
@@ -936,6 +963,8 @@ def _parse_career_rows(row, year, output):
     achievements = str(row[5] or "").split("\n") if len(row) > 5 else []
     distributions = str(row[6] or "").split("\n") if len(row) > 6 else []
     notes = str(row[7] or "").split("\n") if len(row) > 7 else []
+
+    _fix_leaked_char(categories, subjects)
 
     max_len = max(len(subjects), len(scores), len(achievements), 1)
     cleaned_categories = _expand_categories(categories, max_len)
@@ -1000,6 +1029,8 @@ def _parse_arts_physical_rows(row, year, output):
     subjects = _merge_split_names(str(row[2] or "").split("\n")) if len(row) > 2 else []
     credits_list = str(row[3] or "").split("\n") if len(row) > 3 else []
     achievements = str(row[4] or "").split("\n") if len(row) > 4 else []
+
+    _fix_leaked_char(categories, subjects)
 
     max_len = max(len(subjects), len(achievements), 1)
 
