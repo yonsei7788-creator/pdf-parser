@@ -1109,7 +1109,7 @@ def _parse_evaluation_row(row, year, output):
         return
 
     # "과목: 텍스트" 또는 "(N학기)과목: 텍스트" 패턴으로 분리
-    entries = re.split(r"(?:^|\s)(?:\(\d학기\))?([가-힣A-Za-z\s·ⅠⅡ]+?):\s", full_text)
+    entries = re.split(r"(?:^|\s)(?:\(\d학기\))?([가-힣A-Za-z0-9\s·ⅠⅡ]+?):\s", full_text)
 
     if len(entries) > 1:
         # entries[0]은 빈 문자열 또는 첫 과목 전 텍스트
