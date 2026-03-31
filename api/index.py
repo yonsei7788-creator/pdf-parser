@@ -628,6 +628,7 @@ def parse_grades(tables):
 
     current_year = 0
     current_table_type = None  # "general", "career", "artsPhysical", "evaluation"
+    general_wide = False  # 10열 형식: 성취도별 분포비율 + 석차등급 컬럼이 모두 있는 경우
 
     for table in tables:
         if not table:
@@ -646,9 +647,12 @@ def parse_grades(tables):
         if year_match:
             current_year = int(year_match.group(1))
 
-        if "석차등급" in header_text:
+        header_text_nospace = header_text.replace(" ", "")
+        if "석차등급" in header_text_nospace:
             current_table_type = "general"
-        elif "분포비율" in header_text or "진로 선택" in header_text or "진로선택" in header_text:
+            # 석차등급 + 분포비율 모두 있으면 10열 형식
+            general_wide = "분포비율" in header_text_nospace
+        elif "분포비율" in header_text_nospace or "진로선택" in header_text_nospace:
             current_table_type = "career"
         elif re.search(r"체육[ㆍ·]?\s*예술", header_text.replace(" ", "")):
             current_table_type = "artsPhysical"
@@ -696,7 +700,7 @@ def parse_grades(tables):
             if current_table_type == "evaluation":
                 _parse_evaluation_row(row, current_year, evaluations)
             elif current_table_type == "general":
-                _parse_general_rows(row, current_year, general)
+                _parse_general_rows(row, current_year, general, general_wide)
             elif current_table_type == "career":
                 _parse_career_rows(row, current_year, career)
             elif current_table_type == "artsPhysical":
@@ -709,10 +713,13 @@ def parse_grades(tables):
 _general_current_semester = [0]
 
 
-def _parse_general_rows(row, year, output):
+def _parse_general_rows(row, year, output, wide=False):
     """일반과목 — 두 가지 형식 지원:
     1. 병합 셀: 한 행에 여러 과목이 \n으로 구분 (생기부3)
     2. 개별 행: 한 행에 하나의 과목, semester 셀이 비어있으면 이전 학기 상속 (권예호)
+
+    wide=True: 5등급제 10열 형식 (학기|교과|과목|학점|원점수/평균|성취도|성취도별분포비율|석차등급|수강자수|비고)
+    wide=False: 9등급제 8열 형식 (학기|교과|과목|학점수|원점수/평균(표준편차)|성취도(수강자수)|석차등급|비고)
     """
     # 비데이터 행 필터링
     row_text_all = " ".join(str(c or "") for c in row)
@@ -744,8 +751,17 @@ def _parse_general_rows(row, year, output):
     credits_list = str(row[3] or "").split("\n") if len(row) > 3 else []
     scores = str(row[4] or "").split("\n") if len(row) > 4 else []
     achievements = str(row[5] or "").split("\n") if len(row) > 5 else []
-    ranks = str(row[6] or "").split("\n") if len(row) > 6 else []
-    notes = str(row[7] or "").split("\n") if len(row) > 7 else []
+
+    if wide:
+        # 5등급제 10열: [6]=성취도별분포비율, [7]=석차등급, [8]=수강자수, [9]=비고
+        ranks = str(row[7] or "").split("\n") if len(row) > 7 else []
+        student_counts_list = str(row[8] or "").split("\n") if len(row) > 8 else []
+        notes = str(row[9] or "").split("\n") if len(row) > 9 else []
+    else:
+        # 9등급제 8열: [6]=석차등급, [7]=비고
+        ranks = str(row[6] or "").split("\n") if len(row) > 6 else []
+        student_counts_list = []
+        notes = str(row[7] or "").split("\n") if len(row) > 7 else []
 
     _fix_leaked_char(categories, subjects)
 
@@ -766,20 +782,38 @@ def _parse_general_rows(row, year, output):
 
         raw_score, average, std_dev = None, None, None
         if i < len(scores):
-            m = SCORE_RE.search(scores[i])
-            if m:
-                raw_score = safe_int(m.group(1))
-                average = safe_float(m.group(2))
-                std_dev = safe_float(m.group(3))
+            if wide:
+                # 5등급제: "69/74.6" 형식 (표준편차 없음)
+                m = re.match(r"(\d+)/(\d+\.?\d*)", scores[i].strip())
+                if m:
+                    raw_score = safe_int(m.group(1))
+                    average = safe_float(m.group(2))
+            else:
+                # 9등급제: "95/67.1(20.3)" 형식
+                m = SCORE_RE.search(scores[i])
+                if m:
+                    raw_score = safe_int(m.group(1))
+                    average = safe_float(m.group(2))
+                    std_dev = safe_float(m.group(3))
 
         ach_str, student_count = "", None
-        if i < len(achievements):
-            m = ACHIEVEMENT_RE.search(achievements[i])
-            if m:
-                ach_str = m.group(1)
-                student_count = safe_int(m.group(2))
-            elif achievements[i].strip() == "P":
-                ach_str = "P"
+        if wide:
+            # 5등급제: 성취도와 수강자수가 별도 컬럼
+            if i < len(achievements):
+                ach_val = achievements[i].strip()
+                if ach_val in ("A", "B", "C", "D", "E", "P"):
+                    ach_str = ach_val
+            if i < len(student_counts_list):
+                student_count = safe_int(student_counts_list[i])
+        else:
+            # 9등급제: "A(437)" 형식
+            if i < len(achievements):
+                m = ACHIEVEMENT_RE.search(achievements[i])
+                if m:
+                    ach_str = m.group(1)
+                    student_count = safe_int(m.group(2))
+                elif achievements[i].strip() == "P":
+                    ach_str = "P"
 
         # 석차등급: ranks와 subjects의 길이가 다르면 이터레이터에서 가져옴
         rank = None
