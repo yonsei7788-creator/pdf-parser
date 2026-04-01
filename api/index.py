@@ -285,7 +285,9 @@ def parse_creative_activities(tables):
             cell_str = str(cell).strip()
             if len(cell_str) <= 10:
                 continue
-            if AREA_PATTERN.match(cell_str):
+            # 셀의 모든 줄이 영역명이면 건너뜀 (멀티라인 영역명 셀 대응)
+            cell_lines = [l.strip() for l in cell_str.split("\n") if l.strip()]
+            if cell_lines and all(AREA_PATTERN.match(l) for l in cell_lines):
                 continue
             # 짧은 헤더 텍스트 필터 (50자 미만인 경우만 적용)
             if len(cell_str) < 50 and ("학년" in cell_str or "영역" in cell_str or "희망분야" in cell_str):
