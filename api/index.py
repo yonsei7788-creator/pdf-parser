@@ -1385,9 +1385,9 @@ def parse_behavioral_assessments(tables):
 
             if not assessment or len(assessment) < 10:
                 continue
-            # 비공개 텍스트는 빈 문자열로 대체하되 학년 항목은 유지
+            # 비공개 텍스트는 스킵 (해당 학년 자체를 반환하지 않음)
             if is_redacted_text(assessment):
-                assessment = ""
+                continue
             rows.append({
                 "id": new_id(),
                 "year": year,
