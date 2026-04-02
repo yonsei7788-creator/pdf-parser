@@ -772,6 +772,8 @@ def _parse_general_rows(row, year, output, wide=False):
 
     # 석차등급(ranks)은 빈 칸(석차등급 없는 과목)을 건너뛰므로 subjects보다 짧을 수 있음.
     # ranks를 이터레이터로 만들어서 석차등급이 있는 과목에서만 소비.
+    # 과학탐구실험 등 성취도만 기재되고 석차등급이 없는 과목은 소비하지 않음.
+    _NO_RANK_SUBJECTS = {"과학탐구실험"}
     rank_iter = iter(r.strip() for r in ranks if r.strip())
 
     for i in range(max_len):
@@ -822,8 +824,8 @@ def _parse_general_rows(row, year, output, wide=False):
         if len(ranks) == max_len:
             # ranks와 subjects가 같은 길이 → 인덱스 매칭
             rank = safe_int(ranks[i]) if i < len(ranks) else None
-        elif ach_str and ach_str != "P":
-            # ranks가 짧음 → 석차등급 있는 과목(P 아닌)에서만 소비
+        elif ach_str and ach_str != "P" and subj not in _NO_RANK_SUBJECTS:
+            # ranks가 짧음 → 석차등급 있는 과목(P 아닌, 석차등급 없는 과목 제외)에서만 소비
             try:
                 rank = safe_int(next(rank_iter))
             except StopIteration:
