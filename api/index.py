@@ -81,7 +81,11 @@ def classify_table(table, page_text):
             return key
 
     # 2단계: row 0~1까지 확장 (연속 테이블의 서브헤더 포함)
-    header_text = " ".join(str(c or "") for row in table[:2] for c in row)
+    # 긴 셀(본문 데이터)은 제외하여 본문 키워드 오분류 방지
+    header_text = " ".join(
+        str(c or "") for row in table[:2] for c in row
+        if len(str(c or "")) < 100
+    )
     for key, pattern in SECTION_PATTERNS.items():
         if pattern.search(header_text):
             return key
@@ -301,15 +305,27 @@ def parse_creative_activities(tables):
                 note_text = note_candidate
             break
 
+        # 희망분야 감지 (진로활동 행에 포함)
+        wish_field = ""
+        for ci, cell in enumerate(row):
+            if str(cell or "").strip() == "희망분야" and ci + 1 < len(row):
+                val = str(row[ci + 1] or "").strip().replace("\n", " ")
+                if val and not is_redacted_text(val):
+                    wish_field = val
+                break
+
         if areas_found and current_year > 0:
             for idx, area in enumerate(areas_found):
                 h = hours_found[idx] if idx < len(hours_found) else None
-                entries.append(("area", {
+                entry_data = {
                     "year": current_year,
                     "area": area,
                     "hours": h,
                     "note": note_text if idx == 0 else "",
-                }))
+                }
+                if wish_field and "진로" in area:
+                    entry_data["wishField"] = wish_field
+                entries.append(("area", entry_data))
         elif hours_found and current_year > 0:
             # 시간이 있는 행 — 같은 학년 영역에만 시간 할당
             for h in hours_found:
@@ -654,6 +670,8 @@ def parse_grades(tables):
             current_table_type = "general"
             # 석차등급 + 분포비율 모두 있으면 10열 형식
             general_wide = "분포비율" in header_text_nospace
+        elif "이수여부" in header_text_nospace:
+            current_table_type = "passOnly"
         elif "분포비율" in header_text_nospace or "진로선택" in header_text_nospace:
             current_table_type = "career"
         elif re.search(r"체육[ㆍ·]?\s*예술", header_text.replace(" ", "")):
@@ -703,6 +721,8 @@ def parse_grades(tables):
                 _parse_evaluation_row(row, current_year, evaluations)
             elif current_table_type == "general":
                 _parse_general_rows(row, current_year, general, general_wide)
+            elif current_table_type == "passOnly":
+                _parse_pass_only_rows(row, current_year, general)
             elif current_table_type == "career":
                 _parse_career_rows(row, current_year, career)
             elif current_table_type == "artsPhysical":
@@ -713,6 +733,51 @@ def parse_grades(tables):
 
     # 일반과목 파싱에서 사용하는 현재 학기 (개별 행 형식에서 병합 셀 처리용)
 _general_current_semester = [0]
+
+_pass_only_current_semester = [0]
+
+
+def _parse_pass_only_rows(row, year, output):
+    """이수여부(P/NP) 과목: 학기 | 교과 | 과목 | 학점 | 이수여부 | 비고"""
+    semester_val = safe_int(row[0])
+    if semester_val in (1, 2):
+        _pass_only_current_semester[0] = semester_val
+
+    semester = _pass_only_current_semester[0]
+    if semester not in (1, 2):
+        return
+
+    categories = str(row[1] or "").split("\n") if len(row) > 1 else []
+    subjects = str(row[2] or "").split("\n") if len(row) > 2 else []
+    credits_list = str(row[3] or "").split("\n") if len(row) > 3 else []
+    pass_status = str(row[4] or "").split("\n") if len(row) > 4 else []
+    notes = str(row[5] or "").split("\n") if len(row) > 5 else []
+
+    max_len = max(len(subjects), 1)
+    for i in range(max_len):
+        subj = subjects[i].strip() if i < len(subjects) else ""
+        if not subj:
+            continue
+        cat = categories[i].strip() if i < len(categories) else ""
+        cred = safe_int(credits_list[i]) if i < len(credits_list) else None
+        ps = pass_status[i].strip() if i < len(pass_status) else ""
+        note = notes[i].strip() if i < len(notes) else ""
+
+        output.append({
+            "id": new_id(),
+            "year": year,
+            "semester": semester,
+            "category": cat,
+            "subject": subj,
+            "credits": cred,
+            "rawScore": None,
+            "average": None,
+            "standardDeviation": None,
+            "achievement": ps if ps in ("P", "NP") else "",
+            "studentCount": None,
+            "gradeRank": None,
+            "note": note,
+        })
 
 
 def _parse_general_rows(row, year, output, wide=False):
@@ -774,11 +839,26 @@ def _parse_general_rows(row, year, output, wide=False):
     max_len = max(len(subjects), len(scores), len(achievements), 1)
     cleaned_categories = _expand_categories(categories, max_len)
 
+    # P과목 사전 감지 (성취도 컬럼에서)
+    _p_indices = set()
+    for i in range(max_len):
+        if wide:
+            if i < len(achievements) and achievements[i].strip() == "P":
+                _p_indices.add(i)
+        else:
+            if i < len(achievements) and achievements[i].strip() == "P":
+                _p_indices.add(i)
+
     # 석차등급(ranks)은 빈 칸(석차등급 없는 과목)을 건너뛰므로 subjects보다 짧을 수 있음.
     # ranks를 이터레이터로 만들어서 석차등급이 있는 과목에서만 소비.
     # 과학탐구실험 등 성취도만 기재되고 석차등급이 없는 과목은 소비하지 않음.
     _NO_RANK_SUBJECTS = {"과학탐구실험"}
-    rank_iter = iter(r.strip() for r in ranks if r.strip())
+    rank_iter = iter(r.strip() for r in ranks if r.strip() and r.strip() != "P")
+
+    # 점수(scores)도 P과목은 빈 칸이므로 subjects보다 짧을 수 있음.
+    score_short = len(scores) < max_len
+    if score_short:
+        score_iter = iter(s for s in scores if s.strip())
 
     for i in range(max_len):
         subj = subjects[i].strip() if i < len(subjects) else ""
@@ -787,22 +867,33 @@ def _parse_general_rows(row, year, output, wide=False):
 
         cat = cleaned_categories[i] if i < len(cleaned_categories) else ""
         cred = safe_int(credits_list[i]) if i < len(credits_list) else None
+        is_p = i in _p_indices
 
         raw_score, average, std_dev = None, None, None
-        if i < len(scores):
-            if wide:
-                # 5등급제: "69/74.6" 형식 (표준편차 없음)
-                m = re.match(r"(\d+)/(\d+\.?\d*)", scores[i].strip())
-                if m:
-                    raw_score = safe_int(m.group(1))
-                    average = safe_float(m.group(2))
+        if not is_p:
+            if score_short:
+                # 점수가 짧음 → P가 아닌 과목에서만 소비
+                try:
+                    score_text = next(score_iter)
+                except StopIteration:
+                    score_text = ""
             else:
-                # 9등급제: "95/67.1(20.3)" 형식
-                m = SCORE_RE.search(scores[i])
-                if m:
-                    raw_score = safe_int(m.group(1))
-                    average = safe_float(m.group(2))
-                    std_dev = safe_float(m.group(3))
+                score_text = scores[i].strip() if i < len(scores) else ""
+
+            if score_text:
+                if wide:
+                    # 5등급제: "69/74.6" 형식 (표준편차 없음)
+                    m = re.match(r"(\d+)/(\d+\.?\d*)", score_text)
+                    if m:
+                        raw_score = safe_int(m.group(1))
+                        average = safe_float(m.group(2))
+                else:
+                    # 9등급제: "95/67.1(20.3)" 형식
+                    m = SCORE_RE.search(score_text)
+                    if m:
+                        raw_score = safe_int(m.group(1))
+                        average = safe_float(m.group(2))
+                        std_dev = safe_float(m.group(3))
 
         ach_str, student_count = "", None
         if wide:
@@ -836,9 +927,6 @@ def _parse_general_rows(row, year, output, wide=False):
                 rank = None
 
         note = notes[i].strip() if i < len(notes) else ""
-
-        if ach_str == "P":
-            continue
 
         output.append({
             "id": new_id(),
@@ -1148,12 +1236,32 @@ def _parse_evaluation_row(row, year, output):
             subject = entries[j].strip()
             evaluation = entries[j + 1].strip() if j + 1 < len(entries) else ""
             if subject and evaluation:
-                output.append({
-                    "id": new_id(),
-                    "year": year,
-                    "subject": subject,
-                    "evaluation": evaluation,
-                })
+                # "수업량 유연화" 등 별도 활동이 과목 평가 뒤에 붙은 경우 분리
+                parts = re.split(r"(?<=\.)\s+(수업량\s*유연화|학교\s*자율적\s*교육활동)", evaluation)
+                if len(parts) > 1:
+                    evaluation = parts[0].strip()
+                    extra_subject = parts[1].strip()
+                    extra_text = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+                    output.append({
+                        "id": new_id(),
+                        "year": year,
+                        "subject": subject,
+                        "evaluation": evaluation,
+                    })
+                    if extra_text:
+                        output.append({
+                            "id": new_id(),
+                            "year": year,
+                            "subject": extra_subject,
+                            "evaluation": extra_text,
+                        })
+                else:
+                    output.append({
+                        "id": new_id(),
+                        "year": year,
+                        "subject": subject,
+                        "evaluation": evaluation,
+                    })
     elif full_text:
         # Issue 4: 과목:텍스트 패턴이 없고 이전 항목이 있으면 → 페이지 연속 텍스트
         if output:
@@ -1208,9 +1316,9 @@ def parse_behavioral_assessments(tables):
                 assessment = " ".join(str(c or "") for c in row[1:]).strip().replace("\n", " ")
             if not assessment or len(assessment) < 10:
                 continue
-            # 비공개 텍스트 필터링
+            # 비공개 텍스트는 빈 문자열로 대체하되 학년 항목은 유지
             if is_redacted_text(assessment):
-                continue
+                assessment = ""
             rows.append({
                 "id": new_id(),
                 "year": year,
