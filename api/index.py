@@ -749,10 +749,14 @@ def _parse_general_rows(row, year, output, wide=False):
 
     # 각 셀을 \n으로 분리
     categories = str(row[1] or "").split("\n") if len(row) > 1 else []
-    subjects = _merge_split_names(str(row[2] or "").split("\n")) if len(row) > 2 else []
     credits_list = str(row[3] or "").split("\n") if len(row) > 3 else []
     scores = str(row[4] or "").split("\n") if len(row) > 4 else []
     achievements = str(row[5] or "").split("\n") if len(row) > 5 else []
+
+    # 학점/점수 등 숫자 컬럼의 유효 항목 수로 과목 수 참조
+    ref_counts = [len(c) for c in [credits_list, scores, achievements] if any(x.strip() for x in c)]
+    ref_len = max(ref_counts) if ref_counts else None
+    subjects = _merge_split_names(str(row[2] or "").split("\n"), target_len=ref_len) if len(row) > 2 else []
 
     if wide:
         # 5등급제 10열: [6]=성취도별분포비율, [7]=석차등급, [8]=수강자수, [9]=비고
@@ -915,10 +919,11 @@ def _expand_categories(categories, target_len):
     return merged[:target_len]
 
 
-def _merge_split_names(raw_items):
+def _merge_split_names(raw_items, target_len=None):
     """줄바꿈으로 잘린 과목/교과명 병합.
     한글 2자 미만의 짧은 조각("1", "Ⅰ", "험" 등)을 이전 항목에 합침.
     한글 2자 이상이면 독립적 과목명으로 판단하여 유지.
+    target_len이 주어지면: 다른 컬럼(학점, 점수 등) 수를 참조하여 초과 시 추가 병합.
     """
     merged = []
     for s in raw_items:
@@ -936,6 +941,14 @@ def _merge_split_names(raw_items):
         else:
             # 한글 1자 이하 → PDF 줄바꿈 잔여 조각, 이전 항목에 합침
             merged[-1] = merged[-1] + s
+
+    # target_len보다 많으면 가장 짧은 항목을 이전 항목에 합침
+    # 예: "세계 문제와 미" + "래 사회" → "세계 문제와 미래 사회"
+    while target_len and len(merged) > target_len and len(merged) >= 2:
+        min_idx = min(range(1, len(merged)), key=lambda i: len(merged[i]))
+        merged[min_idx - 1] = merged[min_idx - 1] + merged[min_idx]
+        merged.pop(min_idx)
+
     return merged
 
 
@@ -978,12 +991,16 @@ def _parse_career_rows(row, year, output):
         return
 
     categories = str(row[1] or "").split("\n") if len(row) > 1 else []
-    subjects = _merge_split_names(str(row[2] or "").split("\n")) if len(row) > 2 else []
     credits_list = str(row[3] or "").split("\n") if len(row) > 3 else []
     scores = str(row[4] or "").split("\n") if len(row) > 4 else []
     achievements = str(row[5] or "").split("\n") if len(row) > 5 else []
     distributions = str(row[6] or "").split("\n") if len(row) > 6 else []
     notes = str(row[7] or "").split("\n") if len(row) > 7 else []
+
+    # 학점/점수 등 숫자 컬럼의 유효 항목 수로 과목 수 참조
+    ref_counts = [len(c) for c in [credits_list, scores, achievements] if any(x.strip() for x in c)]
+    ref_len = max(ref_counts) if ref_counts else None
+    subjects = _merge_split_names(str(row[2] or "").split("\n"), target_len=ref_len) if len(row) > 2 else []
 
     _fix_leaked_char(categories, subjects)
 
@@ -1117,7 +1134,8 @@ def _parse_evaluation_row(row, year, output):
         return
 
     # "과목: 텍스트" 또는 "(N학기)과목: 텍스트" 패턴으로 분리
-    entries = re.split(r"(?:^|\s)(?:\(\d학기\))?([가-힣A-Za-z0-9\s·ⅠⅡ]+?):\s", full_text)
+    # 과목명은 문장 시작(^) 또는 문장 끝(.) 뒤에만 나타남 — 본문 중 '알기:' 등 오인식 방지
+    entries = re.split(r"(?:^|(?<=\.)\s+)(?:\(\d학기\))?([가-힣A-Za-z0-9\s·ⅠⅡ]+?):\s", full_text)
 
     if len(entries) > 1:
         # entries[0]은 빈 문자열 또는 첫 과목 전 텍스트
