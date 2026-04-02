@@ -333,6 +333,13 @@ def parse_creative_activities(tables):
             # note도 같이 있으면 함께 추가
             if note_text:
                 entries.append(("note", note_text))
+            # wishField가 감지되었으면 직전 진로활동 entry에 적용
+            if wish_field:
+                for j in range(len(entries) - 1, -1, -1):
+                    if entries[j][0] == "area" and "진로" in entries[j][1].get("area", ""):
+                        if "wishField" not in entries[j][1]:
+                            entries[j][1]["wishField"] = wish_field
+                        break
         elif note_text and current_year > 0:
             # 영역 없는 행 = 이전 영역의 특기사항 (continuation)
             entries.append(("note", note_text))
@@ -1193,6 +1200,46 @@ def is_redacted_text(text):
     return bool(REDACTED_PATTERN.search(text))
 
 
+# 세부능력 텍스트 내 비교과 활동 단락 감지 패턴
+# 과목 evaluation 뒤에 붙은 독립적 활동 기술을 분리하기 위한 패턴
+_ORPHAN_ACTIVITY_PATTERNS = [
+    # "2024 모의 정책기구(날짜)" — 연도+모의 이벤트
+    re.compile(r"\d{4}\s+모의\s"),
+    # "'활동명' 활동에서" — 인용된 활동명
+    re.compile(r"'[^'\n]{3,50}'\s*활동에서"),
+    # "'제목'을/를 읽고" — 독서 활동 (단, '제목'라는 보고서를 읽고 등 중간에 조사가 끼면 제외)
+    re.compile(r"'[^'\n]{3,50}'[가-힣]*\s*(?:을|를)\s*읽고"),
+    # "기후 정의 특강과/에" — 특강 참석
+    re.compile(r"[가-힣]+\s+[가-힣]+\s+특강(?:과|에|을)"),
+    # "현대사회 문제 해결을 위한" — 토론/활동
+    re.compile(r"[가-힣]+\s+문제\s*해결을\s*위한\s"),
+    # "xxx을 주제로 한 강연/특강" — 강연 참석
+    re.compile(r"[가-힣]+.{0,30}주제로\s*한\s*(?:강연|특강)"),
+]
+
+
+def _split_orphan_activities(evaluation):
+    """과목 evaluation 텍스트 끝에 붙은 비교과 활동 단락을 분리.
+    Returns (clean_eval, orphan_text). orphan_text는 비어있을 수 있음.
+    충분한 길이의 evaluation(300자+)에서만 동작하며, 200자 이후의
+    문장 경계에서만 분리를 시도함 (false positive 최소화).
+    """
+    if len(evaluation) < 300:
+        return evaluation, ""
+
+    # 문장 경계(". " 또는 ".\n")를 찾아서 이후 텍스트가 orphan 패턴과 일치하는지 확인
+    for m in re.finditer(r"\.\s+", evaluation):
+        pos = m.end()
+        if pos < 200:
+            continue
+        remaining = evaluation[pos:]
+        for pattern in _ORPHAN_ACTIVITY_PATTERNS:
+            if pattern.match(remaining):
+                return evaluation[:m.start() + 1].strip(), remaining.strip()
+
+    return evaluation, ""
+
+
 def _parse_evaluation_row(row, year, output):
     """세부능력: 과목 | 세부능력 텍스트"""
     # 헤더 행 스킵
@@ -1232,6 +1279,8 @@ def _parse_evaluation_row(row, year, output):
         if prefix_text and output:
             output[-1]["evaluation"] += " " + prefix_text
 
+        last_j = len(entries) - 2 if len(entries) >= 3 else -1  # 마지막 과목의 j 인덱스
+
         for j in range(1, len(entries), 2):
             subject = entries[j].strip()
             evaluation = entries[j + 1].strip() if j + 1 < len(entries) else ""
@@ -1242,6 +1291,8 @@ def _parse_evaluation_row(row, year, output):
                     evaluation = parts[0].strip()
                     extra_subject = parts[1].strip()
                     extra_text = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
+                    # split 후 남은 조사 제거 (예: "에서 '지구온난화..." → "'지구온난화...")
+                    extra_text = re.sub(r"^(?:에서|에|으로|과|와)\s+", "", extra_text)
                     output.append({
                         "id": new_id(),
                         "year": year,
@@ -1256,12 +1307,24 @@ def _parse_evaluation_row(row, year, output):
                             "evaluation": extra_text,
                         })
                 else:
+                    # 마지막 과목: 비교과 활동 단락이 뒤에 붙어있을 수 있음
+                    if j == last_j:
+                        evaluation, orphan = _split_orphan_activities(evaluation)
+                    else:
+                        orphan = ""
                     output.append({
                         "id": new_id(),
                         "year": year,
                         "subject": subject,
                         "evaluation": evaluation,
                     })
+                    if orphan:
+                        output.append({
+                            "id": new_id(),
+                            "year": year,
+                            "subject": "",
+                            "evaluation": orphan,
+                        })
     elif full_text:
         # Issue 4: 과목:텍스트 패턴이 없고 이전 항목이 있으면 → 페이지 연속 텍스트
         if output:
@@ -1308,12 +1371,22 @@ def parse_behavioral_assessments(tables):
             if not row:
                 continue
             year = safe_int(row[0])
-            if year is None or year < 1 or year > 3:
-                continue
+
             assessment = str(row[1] or "").strip().replace("\n", " ") if len(row) > 1 else ""
             if not assessment:
                 # 전체 행의 텍스트를 합침
                 assessment = " ".join(str(c or "") for c in row[1:]).strip().replace("\n", " ")
+
+            # 학년이 없는 행 = 페이지 경계 continuation → 이전 항목에 이어붙이기
+            if year is None or year < 1 or year > 3:
+                if rows and assessment and len(assessment) >= 5:
+                    prev = rows[-1]["assessment"]
+                    if prev:
+                        rows[-1]["assessment"] = prev + " " + assessment
+                    else:
+                        rows[-1]["assessment"] = assessment
+                continue
+
             if not assessment or len(assessment) < 10:
                 continue
             # 비공개 텍스트는 빈 문자열로 대체하되 학년 항목은 유지
