@@ -1200,41 +1200,6 @@ def is_redacted_text(text):
     return bool(REDACTED_PATTERN.search(text))
 
 
-# 세부능력 텍스트 내 비교과 활동 단락 감지 패턴
-# 과목 evaluation 뒤에 붙은 독립적 활동 기술을 분리하기 위한 패턴
-_ORPHAN_ACTIVITY_PATTERNS = [
-    # "2024 모의 정책기구(날짜)" — 연도+모의 이벤트
-    re.compile(r"\d{4}\s+모의\s"),
-    # "기후 정의 특강과/에" — 특강 참석
-    re.compile(r"[가-힣]+\s+[가-힣]+\s+특강(?:과|에|을)"),
-    # "현대사회 문제 해결을 위한" — 토론/활동
-    re.compile(r"[가-힣]+\s+문제\s*해결을\s*위한\s"),
-    # "xxx을 주제로 한 강연/특강" — 강연 참석
-    re.compile(r"[가-힣]+.{0,30}주제로\s*한\s*(?:강연|특강)"),
-]
-
-
-def _split_orphan_activities(evaluation):
-    """과목 evaluation 텍스트 끝에 붙은 비교과 활동 단락을 분리.
-    Returns (clean_eval, orphan_text). orphan_text는 비어있을 수 있음.
-    충분한 길이의 evaluation(300자+)에서만 동작하며, 200자 이후의
-    문장 경계에서만 분리를 시도함 (false positive 최소화).
-    """
-    if len(evaluation) < 300:
-        return evaluation, ""
-
-    # 문장 경계(". " 또는 ".\n")를 찾아서 이후 텍스트가 orphan 패턴과 일치하는지 확인
-    for m in re.finditer(r"\.\s+", evaluation):
-        pos = m.end()
-        if pos < 200:
-            continue
-        remaining = evaluation[pos:]
-        for pattern in _ORPHAN_ACTIVITY_PATTERNS:
-            if pattern.match(remaining):
-                return evaluation[:m.start() + 1].strip(), remaining.strip()
-
-    return evaluation, ""
-
 
 def _parse_evaluation_row(row, year, output):
     """세부능력: 과목 | 세부능력 텍스트"""
@@ -1275,8 +1240,6 @@ def _parse_evaluation_row(row, year, output):
         if prefix_text and output:
             output[-1]["evaluation"] += " " + prefix_text
 
-        last_j = len(entries) - 2 if len(entries) >= 3 else -1  # 마지막 과목의 j 인덱스
-
         for j in range(1, len(entries), 2):
             subject = entries[j].strip()
             evaluation = entries[j + 1].strip() if j + 1 < len(entries) else ""
@@ -1303,24 +1266,12 @@ def _parse_evaluation_row(row, year, output):
                             "evaluation": extra_text,
                         })
                 else:
-                    # 마지막 과목: 비교과 활동 단락이 뒤에 붙어있을 수 있음
-                    if j == last_j:
-                        evaluation, orphan = _split_orphan_activities(evaluation)
-                    else:
-                        orphan = ""
                     output.append({
                         "id": new_id(),
                         "year": year,
                         "subject": subject,
                         "evaluation": evaluation,
                     })
-                    if orphan:
-                        output.append({
-                            "id": new_id(),
-                            "year": year,
-                            "subject": "",
-                            "evaluation": orphan,
-                        })
     elif full_text:
         # Issue 4: 과목:텍스트 패턴이 없고 이전 항목이 있으면 → 페이지 연속 텍스트
         if output:
