@@ -124,6 +124,8 @@ def parse_attendance(table):
         if year is None or year < 1 or year > 3:
             continue
         total_days = safe_int(row[1]) if len(row) > 1 else None
+        if not total_days:
+            continue
 
         vals = {}
         # 12개 값: index 2~13
