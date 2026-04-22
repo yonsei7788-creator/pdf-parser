@@ -95,6 +95,13 @@ def classify_table(table, page_text):
     all_text = " ".join(str(c or "") for row in table[:3] for c in row)
     if "석차등급" in all_text or "분포비율" in all_text:
         return "grades"
+    # 출결 테이블: "출결상황" 헤더가 테이블 밖 본문에 있는 경우(대입전형용)
+    # 컬럼 헤더 조합으로 식별 — "수업일수" + "결석"/"지각"/"조퇴" 중 하나
+    header_norm = header_text.replace(" ", "")
+    if "수업일수" in header_norm and (
+        "결석" in header_norm or "지각" in header_norm or "조퇴" in header_norm
+    ):
+        return "attendance"
     # "체육" + "예술" + 성취도 → grades (체육/예술 하위 테이블)
     if "체육" in all_text and "예술" in all_text and "성취도" in all_text:
         return "grades"
@@ -115,6 +122,13 @@ ATTENDANCE_KEYS = [
 ]
 
 
+_ATTENDANCE_TOKEN_RE = re.compile(r"^[\.\-]?\d+$|^\.$|^-$")
+
+
+def _is_numeric_token(tok):
+    return bool(_ATTENDANCE_TOKEN_RE.match(tok))
+
+
 def parse_attendance(table):
     rows = []
     for row in table:
@@ -127,15 +141,33 @@ def parse_attendance(table):
         if not total_days:
             continue
 
-        vals = {}
-        # 12개 값: index 2~13
-        for i, key in enumerate(ATTENDANCE_KEYS):
-            val_idx = i + 2
-            vals[key] = safe_int(row[val_idx]) if val_idx < len(row) else None
+        # 중간 셀 토큰화 — pdfplumber가 결석/미인정·기타 등 인접 셀을 병합해
+        # 하나의 셀에 '. .' 형태로 반환하는 경우(대입전형용)를 대응.
+        # 마지막 셀은 일반적으로 특기사항(텍스트) — 숫자/마침표만 있으면 데이터로 취급.
+        data_cells = list(row[2:-1]) if len(row) > 2 else []
+        last_cell = str(row[-1] or "").strip() if len(row) > 2 else ""
+        last_parts = last_cell.split() if last_cell else []
+        if last_parts and all(_is_numeric_token(p) for p in last_parts):
+            data_cells.append(row[-1])
+            note = ""
+        else:
+            note = last_cell.lstrip(".")
 
-        note = str(row[-1] or "").strip() if len(row) > 14 else ""
-        # "." 제거
-        note = note.lstrip(".")
+        tokens = []
+        for cell in data_cells:
+            cell_str = str(cell or "").strip()
+            if not cell_str:
+                tokens.append("")
+                continue
+            parts = cell_str.split()
+            if all(_is_numeric_token(p) for p in parts):
+                tokens.extend(parts)
+            else:
+                tokens.append(cell_str)
+
+        vals = {}
+        for i, key in enumerate(ATTENDANCE_KEYS):
+            vals[key] = safe_int(tokens[i]) if i < len(tokens) else None
 
         rows.append({
             "id": new_id(),
@@ -717,13 +749,18 @@ def parse_grades(tables):
             if current_year == 0:
                 continue
 
-            # 헤더 행 스킵
+            # 헤더 행 스킵 — 셀 단위로 판별(본문 텍스트에 해당 단어가 우연히 포함돼
+            # 세부능력 행이 스킵되는 현상 방지)
             row_text = " ".join(str(c or "") for c in row)
-            if "학기" in row_text and "교과" in row_text and "과목" in row_text:
+            first_cells = [str(c or "").strip() for c in row[:3]]
+            if first_cells[:3] == ["학기", "교과", "과목"]:
                 continue
-            if "표준편차" in row_text or "수강자수" in row_text:
+            # 2차 헤더(표준편차/수강자수, 이수학점 합계 등)는 짧은 셀에만 등장
+            short_cells = [str(c or "").strip() for c in row if len(str(c or "").strip()) < 30]
+            short_joined = " ".join(short_cells)
+            if "표준편차" in short_joined or "수강자수" in short_joined:
                 continue
-            if "이수학점" in row_text or "이수단위" in row_text:
+            if "이수학점" in short_joined or "이수단위" in short_joined:
                 continue
 
             if current_table_type == "evaluation":
@@ -848,15 +885,23 @@ def _parse_general_rows(row, year, output, wide=False):
     max_len = max(len(subjects), len(scores), len(achievements), 1)
     cleaned_categories = _expand_categories(categories, max_len)
 
-    # P과목 사전 감지 (성취도 컬럼에서)
+    # P과목 사전 감지 — 성취도 컬럼의 "P" (표준 9등급제)
     _p_indices = set()
     for i in range(max_len):
-        if wide:
-            if i < len(achievements) and achievements[i].strip() == "P":
-                _p_indices.add(i)
-        else:
-            if i < len(achievements) and achievements[i].strip() == "P":
-                _p_indices.add(i)
+        if i < len(achievements) and achievements[i].strip() == "P":
+            _p_indices.add(i)
+
+    # 석차등급 컬럼에 "P"가 있는 경우(대입전형용 등) — P 과목은 점수/성취도가 비어
+    # 마지막 과목에 위치하므로, 남은 P 수만큼 뒤에서부터 마킹.
+    p_in_ranks_count = sum(1 for r in ranks if r.strip() == "P")
+    remaining_p = p_in_ranks_count - len(_p_indices)
+    if remaining_p > 0:
+        for idx in range(max_len - 1, -1, -1):
+            if remaining_p <= 0:
+                break
+            if idx not in _p_indices:
+                _p_indices.add(idx)
+                remaining_p -= 1
 
     # 석차등급(ranks)은 빈 칸(석차등급 없는 과목)을 건너뛰므로 subjects보다 짧을 수 있음.
     # ranks를 이터레이터로 만들어서 석차등급이 있는 과목에서만 소비.
@@ -922,13 +967,19 @@ def _parse_general_rows(row, year, output, wide=False):
                     student_count = safe_int(m.group(2))
                 elif achievements[i].strip() == "P":
                     ach_str = "P"
+        # 석차등급 셀의 "P"로 감지된 P 과목 — 성취도 문자열이 비어있을 때만 덮어씌움
+        if is_p and not ach_str:
+            ach_str = "P"
 
         # 석차등급: ranks와 subjects의 길이가 다르면 이터레이터에서 가져옴
         rank = None
         if len(ranks) == max_len:
             # ranks와 subjects가 같은 길이 → 인덱스 매칭
-            rank = safe_int(ranks[i]) if i < len(ranks) else None
-        elif ach_str and ach_str != "P" and subj not in _NO_RANK_SUBJECTS:
+            # ranks 셀에 "P"가 오면(대입전형용) rank는 아닌 P 마킹이므로 숫자 파싱만
+            r_str = ranks[i].strip() if i < len(ranks) else ""
+            if r_str and r_str != "P":
+                rank = safe_int(r_str)
+        elif subj not in _NO_RANK_SUBJECTS and not is_p:
             # ranks가 짧음 → 석차등급 있는 과목(P 아닌, 석차등급 없는 과목 제외)에서만 소비
             try:
                 rank = safe_int(next(rank_iter))
@@ -980,6 +1031,10 @@ def _expand_categories(categories, target_len):
                 is_continuation = True
             # "양", "덕포함)" 등 1글자 잔여 — 유효 교과명이 아닌 경우만
             elif len(cat) <= 1 and cat not in VALID_SHORT_CATS:
+                is_continuation = True
+            # "기술·가정/제2외국어/한문/교양" 류 복합 교과명이 중간에 끊긴 경우
+            # (예: "기술·가정/제2외국" + "어/한문/교양", "기술·가정/제2외국어/한문" + "/교양")
+            elif "기술" in prev and "가정" in prev and not prev.endswith("교양"):
                 is_continuation = True
 
         if is_continuation and merged:
@@ -1232,8 +1287,14 @@ def _parse_evaluation_row(row, year, output):
         return
 
     # "과목: 텍스트" 또는 "(N학기)과목: 텍스트" 패턴으로 분리
-    # 과목명은 문장 시작(^) 또는 문장 끝(.) 뒤에만 나타남 — 본문 중 '알기:' 등 오인식 방지
-    entries = re.split(r"(?:^|(?<=\.)\s+)(?:\(\d학기\))?([가-힣A-Za-z0-9\s·ⅠⅡ]+?):\s", full_text)
+    # 과목명은 문장 시작(^), 문장 끝(.) 뒤, 또는 (N학기) 앞에만 나타남
+    # — 본문 중 '알기:' 등 오인식 방지. (N학기) 앞 경계는 이전 문장이 마침표 없이 끝나는
+    # 대입전형용 PDF 케이스 대응.
+    entries = re.split(
+        r"(?:^|(?<=\.)\s+|\s+(?=\(\d학기\)))"
+        r"(?:\(\d학기\))?([가-힣A-Za-z0-9\s·ⅠⅡ]+?):\s",
+        full_text,
+    )
 
     if len(entries) > 1:
         # entries[0]은 빈 문자열 또는 첫 과목 전 텍스트
