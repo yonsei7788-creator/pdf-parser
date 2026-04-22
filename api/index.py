@@ -959,7 +959,7 @@ def _parse_general_rows(row, year, output, wide=False):
             if i < len(student_counts_list):
                 student_count = safe_int(student_counts_list[i])
         else:
-            # 9등급제: "A(437)" 형식
+            # 9등급제: "A(437)" 또는 수강자수만 있는 "(437)" 형식
             if i < len(achievements):
                 m = ACHIEVEMENT_RE.search(achievements[i])
                 if m:
@@ -967,6 +967,11 @@ def _parse_general_rows(row, year, output, wide=False):
                     student_count = safe_int(m.group(2))
                 elif achievements[i].strip() == "P":
                     ach_str = "P"
+                else:
+                    # 일반과목은 성취도 문자 없이 "(수강자수)"만 기재됨
+                    mc = re.search(r"\((\d+)\)", achievements[i])
+                    if mc:
+                        student_count = safe_int(mc.group(1))
         # 석차등급 셀의 "P"로 감지된 P 과목 — 성취도 문자열이 비어있을 때만 덮어씌움
         if is_p and not ach_str:
             ach_str = "P"
