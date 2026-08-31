@@ -19,7 +19,10 @@ import sys
 import json
 import re
 import uuid
+from collections import Counter
+
 import pdfplumber
+from pdfplumber.utils.text import chars_to_textmap
 
 
 def safe_int(val):
@@ -1415,6 +1418,188 @@ def parse_behavioral_assessments(tables):
     return rows
 
 
+# ─── Table Row Alignment ──────────────────────────────────────────────────
+
+# 성적 테이블(일반/진로선택/체육·예술)은 첫 3개 컬럼이 항상 학기|교과|과목
+_SUBJECT_TABLE_HEADER = ("학기", "교과", "과목")
+
+# 재그룹핑 대상 셀의 최대 줄 길이 — 교과/과목명은 짧다.
+# 서술형 셀(세부능력 등)을 실수로 병합하지 않기 위한 안전장치.
+_WRAPPED_LINE_MAX_LEN = 30
+
+# 행 수 후보로 인정하는 최소 컬럼 수 — 서로 독립적인 두 컬럼이 같은 줄 수를
+# 가질 때만 신뢰한다. 한 컬럼만 가진 줄 수는 그 컬럼이 접힌 결과일 수 있다.
+_MIN_ROW_COUNT_SUPPORT = 2
+
+
+def _is_subject_header_row(row):
+    """성적 테이블의 컬럼 헤더 행(학기|교과|과목|...)인지 판별"""
+    if not row or len(row) < 3:
+        return False
+    head = tuple(str(c or "").replace(" ", "") for c in row[:3])
+    return head == _SUBJECT_TABLE_HEADER
+
+
+def _is_subject_table(data):
+    """학기|교과|과목 헤더를 가진 성적 테이블인지 판별"""
+    return any(_is_subject_header_row(row) for row in data)
+
+
+def _char_in_bbox(char, bbox):
+    """pdfplumber Table.extract()와 동일한 셀 포함 판정 (문자 중심점 기준)"""
+    x0, top, x1, bottom = bbox
+    h_mid = (char["x0"] + char["x1"]) / 2
+    v_mid = (char["top"] + char["bottom"]) / 2
+    return x0 <= h_mid < x1 and top <= v_mid < bottom
+
+
+def _median(values):
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def _row_bands(cell_lines, n_rows):
+    """줄 수가 n_rows인 셀들의 중심 y 중앙값 = 데이터 행의 기준선"""
+    aligned = [
+        [center for center, _ in sorted(lines)]
+        for lines in cell_lines.values()
+        if len(lines) == n_rows
+    ]
+    if not aligned:
+        return []
+    return [_median(col) for col in zip(*aligned)]
+
+
+def _nearest_band(center, bands):
+    """줄의 중심 y와 가장 가까운 기준선의 인덱스"""
+    return min(range(len(bands)), key=lambda i: abs(bands[i] - center))
+
+
+def _band_misfit(cell_lines, bands):
+    """기준선 집합의 오차 — 묶음 무게중심과 기준선 사이 거리의 합.
+
+    PDF는 한 행 안에서 접힌 줄들을 세로 중앙 정렬해 그린다. 따라서 기준선이
+    올바르면 같은 행에 묶인 줄들의 무게중심이 기준선과 거의 일치하고,
+    행 수를 잘못 잡으면 오차가 커진다.
+    """
+    total = 0.0
+    for lines in cell_lines.values():
+        groups = {}
+        for center, _ in lines:
+            groups.setdefault(_nearest_band(center, bands), []).append(center)
+        for band_idx, centers in groups.items():
+            total += abs(sum(centers) / len(centers) - bands[band_idx])
+    return total
+
+
+def _detect_row_count(cell_lines):
+    """실제 데이터 행 수 추정.
+
+    접힌 줄이 있는 컬럼은 실제 행 수보다 줄이 많고, 값이 빠진 컬럼(석차등급 등)은
+    적다. 따라서 둘 이상의 컬럼이 동시에 같은 줄 수를 가질 때만 후보로 인정하고,
+    후보가 여럿이면 기준선 오차가 가장 작은 쪽(동률이면 작은 쪽)을 고른다.
+    근거가 없으면 None — 이 경우 원본을 그대로 둔다.
+    """
+    counts = Counter(len(lines) for lines in cell_lines.values())
+    best, best_err = None, None
+    for n in sorted(counts):
+        if counts[n] < _MIN_ROW_COUNT_SUPPORT:
+            continue
+        bands = _row_bands(cell_lines, n)
+        if not bands:
+            continue
+        err = _band_misfit(cell_lines, bands)
+        if best_err is None or err < best_err - 1e-6:
+            best, best_err = n, err
+    return best
+
+
+def regroup_row_cells(cell_lines):
+    """한 테이블 행의 셀별 텍스트 줄을 세로 위치 기준으로 재그룹핑.
+
+    cell_lines: {열 인덱스: [(중심 y, 텍스트), ...]}
+    반환: {열 인덱스: 재구성된 셀 텍스트} — 변경이 필요한 열만 포함.
+
+    학점수/원점수/성취도처럼 줄바꿈이 없는 컬럼의 줄 위치가 실제 행의 기준선이
+    되고, 셀 폭 때문에 접힌 줄은 같은 기준선에 묶여 다시 이어붙는다.
+    """
+    if not cell_lines:
+        return {}
+
+    n_rows = _detect_row_count(cell_lines)
+    if not n_rows:
+        return {}
+    bands = _row_bands(cell_lines, n_rows)
+
+    result = {}
+    for ci, lines in cell_lines.items():
+        if len(lines) <= n_rows:
+            continue  # 접힌 줄 없음 — 원본 유지
+        if any(len(text) > _WRAPPED_LINE_MAX_LEN for _, text in lines):
+            continue  # 서술형 셀 보호
+        groups = [[] for _ in bands]
+        for center, text in sorted(lines):
+            groups[_nearest_band(center, bands)].append(text)
+        result[ci] = "\n".join("".join(g) for g in groups)
+    return result
+
+
+def _align_wrapped_cells(page, table, data):
+    """셀 폭 때문에 접힌 교과/과목명을 y좌표 기준으로 원래 한 줄로 복원.
+
+    생기부 성적 테이블은 과목 사이에 가로 구분선이 없어 pdfplumber가 여러 과목을
+    한 행으로 반환한다. 이때 셀 폭을 넘는 이름은 줄바꿈되어("현대사회의 윤" +
+    "리적 쟁점") 해당 컬럼의 줄 수가 실제 과목 수보다 많아지고, 줄 인덱스로
+    짝지으면 다음 과목과 어긋난다 (→ "리적 쟁점물리학Ⅱ").
+
+    문자열 길이 추정 대신 각 줄의 세로 위치를 사용한다.
+    """
+    page_chars = page.chars
+
+    for ri, table_row in enumerate(table.rows):
+        if ri >= len(data):
+            break
+        # 헤더 행("원점수/과목평균\n(표준편차)" 등)은 원본 줄바꿈을 유지
+        if _is_subject_header_row(data[ri]):
+            continue
+        row_chars = [c for c in page_chars if _char_in_bbox(c, table_row.bbox)]
+        if not row_chars:
+            continue
+
+        # 셀별 텍스트 줄 + 세로 중심 좌표
+        cell_lines = {}
+        for ci, cell in enumerate(table_row.cells):
+            if cell is None or ci >= len(data[ri]):
+                continue
+            chars = [c for c in row_chars if _char_in_bbox(c, cell)]
+            if not chars:
+                continue
+            lines = chars_to_textmap(chars).extract_text_lines(
+                strip=True, return_chars=False
+            )
+            if lines:
+                cell_lines[ci] = [
+                    ((ln["top"] + ln["bottom"]) / 2, ln["text"]) for ln in lines
+                ]
+
+        for ci, text in regroup_row_cells(cell_lines).items():
+            data[ri][ci] = text
+
+    return data
+
+
+def extract_tables_aligned(page):
+    """page.extract_tables()와 동일하되, 성적 테이블은 접힌 줄을 좌표로 복원"""
+    tables = []
+    for table in page.find_tables():
+        data = table.extract()
+        if _is_subject_table(data):
+            data = _align_wrapped_cells(page, table, data)
+        tables.append(data)
+    return tables
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────
 
 def _fix_rotated_pdf(pdf_path):
@@ -1481,7 +1666,7 @@ def parse_pdf(pdf_path):
         if page_year_match:
             pending_grade_year = int(page_year_match.group(1))
 
-        tables = page.extract_tables()
+        tables = extract_tables_aligned(page)
 
         for table in tables:
             if not table:
